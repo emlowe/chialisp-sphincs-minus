@@ -1,0 +1,11 @@
+; verify.clsp run inside a softfork guard, so it works before hard fork 2.
+; COST must equal the guarded run's exact cost; see README. Success is (),
+; rejection (including a wrong COST) raises.
+(mod (COST PUBLIC_KEY MESSAGE_HASH SIGNATURE)
+  (include *standard-cl-26*)
+
+  (compile-file VERIFIER "verify.clsp")
+
+  ; Extension 1 enables keccak256 inside the guard (soft fork 6).
+  (softfork COST 1 VERIFIER (list PUBLIC_KEY MESSAGE_HASH SIGNATURE))
+)

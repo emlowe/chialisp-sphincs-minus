@@ -44,6 +44,25 @@ def args(*values):
     return b''.join(b'\xff' + atom(value) for value in values) + b'\x80'
 
 
+def int_atom(value):
+    return value.to_bytes((value.bit_length() + 8) // 8, 'big')
+
+
+# Entering a softfork guard costs 140 on top of the guarded program's own cost.
+GUARD_COST = 140
+
+
+def guarded_cost(program, pk, msg, sig):
+    """Exact COST for verify_guarded.clsp: a dry run of verify.clsp plus GUARD_COST.
+
+    The dry run enables keccak256 outside the guard; the operator costs the same
+    either way. Raises if the signature is invalid.
+    """
+    cost, _ = run_chia_program(program, args(pk, msg, sig), 11000000000,
+                               MEMPOOL_MODE | ENABLE_KECCAK_OPS_OUTSIDE_GUARD)
+    return cost + GUARD_COST
+
+
 def tool(name):
     return os.environ.get(f'CHIALISP_{name.upper()}', name)
 
@@ -69,7 +88,20 @@ class SphincsMinusTests(unittest.TestCase):
         cls.program = Path(cls.temp.name) / 'verify.hex'
         cls.program.write_text(assembled.stdout.strip())
         print(f'Compiled verifier: {len(bytes.fromhex(assembled.stdout.strip()))} bytes')
+        cls.guarded = cls.compile('verify_guarded.clsp')
+        print(f'Compiled guarded wrapper: {len(cls.guarded)} bytes')
         cls.costs = []
+
+    @classmethod
+    def compile(cls, name):
+        compiled = subprocess.run([tool('run'), '-i', str(HERE), str(HERE / name)],
+                                  text=True, capture_output=True, check=True, cwd=cls.temp.name)
+        assert not failed(compiled), compiled.stdout + compiled.stderr
+        source = Path(cls.temp.name) / f'{name}.clvm'
+        source.write_text(compiled.stdout)
+        assembled = subprocess.run([tool('opc'), str(source)],
+                                   text=True, capture_output=True, check=True)
+        return bytes.fromhex(assembled.stdout.strip())
 
     def execute(self, encoded):
         return subprocess.run(
@@ -132,6 +164,31 @@ class SphincsMinusTests(unittest.TestCase):
         # Before hard fork 2 the bare keccak256 operator is rejected.
         with self.assertRaisesRegex(ValueError, 'unimplemented operator'):
             run_chia_program(program, args(pk, msg, sig), 11000000000, MEMPOOL_MODE)
+
+    @unittest.skipUnless(run_chia_program, 'optional chia_rs consensus runner is unavailable')
+    def test_softfork_guard(self):
+        # Today's rules: no hard fork 2 flag; keccak256 only inside guard extension 1.
+        program = bytes.fromhex(self.program.read_text())
+        costs = set()
+        for vector in self.vectors:
+            pk, msg, sig = self.inputs(vector)
+            cost = guarded_cost(program, pk, msg, sig)
+            costs.add(cost)
+            with self.subTest(vector=vector['name']):
+                _, result = run_chia_program(self.guarded, args(int_atom(cost), pk, msg, sig),
+                                             11000000000, MEMPOOL_MODE)
+                self.assertEqual(result.atom, b'')
+                for wrong in (cost - 1, cost + 1, 13000000):
+                    with self.assertRaises(ValueError):
+                        run_chia_program(self.guarded, args(int_atom(wrong), pk, msg, sig),
+                                         11000000000, MEMPOOL_MODE)
+                # A bad signature still fails the spend inside the guard.
+                bad = sig[:-1] + bytes([sig[-1] ^ 1])
+                with self.assertRaisesRegex(ValueError, 'clvm raise'):
+                    run_chia_program(self.guarded, args(int_atom(cost), pk, msg, bad),
+                                     11000000000, MEMPOOL_MODE)
+        self.assertGreater(len(costs), 1, 'guarded cost is expected to vary by signature')
+        print('Exact guarded COST values:', sorted(costs))
 
     def test_malformed_inputs(self):
         pk, msg, sig = self.inputs(self.vectors[0])

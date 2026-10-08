@@ -1,0 +1,103 @@
+; SPHINCS- C13 verifier (keccak256, FIPS 205 uncompressed ADRS). Inputs are
+; three atoms; success is (), rejection raises.
+(mod (PUBLIC_KEY MESSAGE_HASH SIGNATURE)
+  (include *standard-cl-26*)
+
+  ; C13 parameters: h=22 d=2 a=19 k=7 w=8 l=43 target_sum=208, n=16.
+  (defconstant Z16 0x00000000000000000000000000000000)
+  (defconstant Z28 0x00000000000000000000000000000000000000000000000000000000)
+  (defconstant HMSG_DOMAIN 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)
+
+  ; CLVM integers are signed and variable width. Wire integers are unsigned BE.
+  (defun uint (BYTES) (+ (concat 0x00 BYTES) 0))
+  (defun be (N SIZE)
+    (assign PAD (concat Z16 N)
+      (substr PAD (- (strlen PAD) SIZE))))
+  (defun bits (VALUE SHIFT MASK) (logand MASK (ash VALUE (- 0 SHIFT))))
+
+  ; The EVM verifier works on 32-byte words holding n=16-byte values in their
+  ; high half; reproduce that framing so keys and signatures interoperate.
+  (defun word (NODE) (concat NODE Z16))
+  (defun address (LAYER TREE TYPE W1 W2 W3)
+    (concat (be LAYER 4) (be TREE 12) (be TYPE 4) (be W1 4) (be W2 4) (be W3 4)))
+  (defun thash (SEED ADDRESS DATA)
+    (substr (keccak256 SEED ADDRESS DATA) 0 16))
+  (defun node16 (SIG OFFSET) (substr SIG OFFSET (+ OFFSET 16)))
+
+  ; Generic Merkle walk. TREE_INDEX maps (height, parent index) to word3 so FORS
+  ; trees can fold their tree number into the index space (FIPS 205 Alg. 17).
+  (defun merkle (SEED LAYER TREE TYPE W1 FORS_TREE HEIGHT LIMIT INDEX AUTH OFFSET NODE)
+    (if (= HEIGHT LIMIT) NODE
+      (assign
+        SIBLING (word (node16 AUTH (+ OFFSET (* HEIGHT 16))))
+        PARENT (ash INDEX -1)
+        W3 (logior PARENT (ash FORS_TREE (- (- LIMIT 1) HEIGHT)))
+        (merkle SEED LAYER TREE TYPE W1 FORS_TREE (+ HEIGHT 1) LIMIT PARENT AUTH OFFSET
+          (thash SEED (address LAYER TREE TYPE W1 (+ HEIGHT 1) (if (= TYPE 3) W3 PARENT))
+            (if (logand INDEX 1) (concat SIBLING (word NODE)) (concat (word NODE) SIBLING)))))))
+
+  ; FORS+C: six normal trees, then the forced-zero tree whose revealed value is
+  ; hashed once at leaf 0. Returns the concatenated 32-byte root words.
+  (defun fors (SEED TREE LEAF SIG DIGEST I ROOTS)
+    (if (= I 6)
+      (concat ROOTS
+        (word (thash SEED (address 0 TREE 3 LEAF 0 (ash 6 19)) (word (node16 SIG 112)))))
+      (assign
+        INDEX (bits DIGEST (* I 19) 0x7ffff)
+        NODE (thash SEED (address 0 TREE 3 LEAF 0 (logior (ash I 19) INDEX))
+               (word (node16 SIG (+ 16 (* I 16)))))
+        ROOT (merkle SEED 0 TREE 3 LEAF I 0 19 INDEX SIG (+ 128 (* I 304)) NODE)
+        (fors SEED TREE LEAF SIG DIGEST (+ I 1) (concat ROOTS (word ROOT))))))
+
+  (defun digit-sum (DIGEST I SUM)
+    (if (= I 43) SUM (digit-sum DIGEST (+ I 1) (+ SUM (bits DIGEST (* I 3) 7)))))
+
+  ; Complete a WOTS chain from the signature's digit through hash index 6.
+  (defun chain (SEED LAYER TREE LEAF CHAIN STEP NODE)
+    (if (= STEP 7) NODE
+      (chain SEED LAYER TREE LEAF CHAIN (+ STEP 1)
+        (thash SEED (address LAYER TREE 0 LEAF CHAIN STEP) (word NODE)))))
+  (defun wots (SEED LAYER TREE LEAF SIG OFFSET DIGEST I TIPS)
+    (if (= I 43) TIPS
+      (wots SEED LAYER TREE LEAF SIG OFFSET DIGEST (+ I 1)
+        (concat TIPS
+          (word (chain SEED LAYER TREE LEAF I (bits DIGEST (* I 3) 7)
+                  (node16 SIG (+ OFFSET (* I 16)))))))))
+
+  ; Each layer is 43 WOTS+C chains, a 4-byte grinding count and 11 auth nodes.
+  (defun hypertree (SEED SIG LAYER INDEX NODE)
+    (if (= LAYER 2) NODE
+      (assign
+        LEAF (logand INDEX 0x7ff)
+        TREE (ash INDEX -11)
+        START (+ 1952 (* LAYER 868))
+        COUNT (substr SIG (+ START 688) (+ START 692))
+        DIGEST (uint (keccak256 SEED (address LAYER TREE 0 LEAF 0 0) (word NODE)
+                       Z28 COUNT))
+        (if (= (digit-sum DIGEST 0 0) 208)
+          (assign
+            TIPS (wots SEED LAYER TREE LEAF SIG START DIGEST 0 ())
+            WOTS_PK (thash SEED (address LAYER TREE 1 LEAF 0 0) TIPS)
+            (hypertree SEED SIG (+ LAYER 1) TREE
+              (merkle SEED LAYER TREE 2 0 0 0 11 LEAF SIG (+ START 692) WOTS_PK)))
+          (x)))))
+
+  (if (all (= (strlen PUBLIC_KEY) 32) (= (strlen MESSAGE_HASH) 32)
+           (= (strlen SIGNATURE) 3688))
+    (assign
+      SEED (word (substr PUBLIC_KEY 0 16))
+      ROOT (substr PUBLIC_KEY 16 32)
+      DIGEST (uint (keccak256 SEED (word ROOT) (word (substr SIGNATURE 0 16))
+                     MESSAGE_HASH HMSG_DOMAIN))
+      HT_INDEX (bits DIGEST 133 0x3fffff)
+      ; FORS+C requires the last 19-bit FORS index to be zero.
+      (if (= (bits DIGEST 114 0x7ffff) 0)
+        (assign
+          LEAF (logand HT_INDEX 0x7ff)
+          TREE (ash HT_INDEX -11)
+          ROOTS (fors SEED TREE LEAF SIGNATURE DIGEST 0 ())
+          FORS_PK (thash SEED (address 0 TREE 4 LEAF 0 0) ROOTS)
+          (if (= (hypertree SEED SIGNATURE 0 HT_INDEX FORS_PK) ROOT) () (x)))
+        (x)))
+    (x))
+)
